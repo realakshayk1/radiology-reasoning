@@ -1,0 +1,499 @@
+# RadReason: Multimodal Chest X-ray Copilot — Agent PRD
+> Drop this into every new agent session as a Knowledge Item.
+> Last updated: March 2026
+
+---
+
+## 1. What This Project Is
+
+A multimodal applied ML system that takes a chest X-ray image, predicts likely thoracic
+findings, retrieves relevant evidence from radiology reports, and generates a structured
+clinician-readable summary with citations.
+
+**The two core questions:**
+1. Can a multi-label CNN trained on public data achieve competitive AUROC on major
+   thoracic findings without private EHR access?
+2. Can RAG over radiology reports produce grounded summaries that follow a strict JSON schema?
+
+**Stack in one line:** PyTorch image classifier → FAISS retrieval → GPT-5 mini generation → FastAPI + Streamlit.
+
+**Dataset: OpenI IU Chest X-ray**
+Indiana University chest X-ray collection — 3,955 radiology reports paired with 7,470 PNG
+images. Freely available, no credentialing required. Small enough to iterate fast; structured
+enough to build a real multimodal pipeline.
+
+- Download: PNG images (.tgz) → `data/raw/images/`
+- Download: XML reports (.tgz) → `data/raw/reports/`
+- Skip DICOM — heavier, harder to preprocess, no MVP benefit
+
+**Critical:** Keep raw files untouched in `data/raw/`. Never rename images before building
+the metadata table. Never store raw data in a public repo.
+
+---
+
+## 2. Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Image modeling | PyTorch, torchvision |
+| Backbone | DenseNet121 or EfficientNet-B0 (ImageNet pretrained) |
+| Loss | BCEWithLogitsLoss (multi-label) |
+| Calibration | Temperature scaling (custom) |
+| Retrieval | sentence-transformers, FAISS (faiss-cpu) |
+| Generation | OpenAI API — `gpt-5-mini-2025-08-07` |
+| Schema enforcement | pydantic v2 |
+| API | FastAPI + uvicorn |
+| UI | Streamlit |
+| Containers | Docker + docker-compose |
+| Metrics | scikit-learn (AUROC, F1), torchmetrics |
+| Environment | Python 3.10, conda or venv |
+
+---
+
+## 3. Project Structure
+
+```
+radreason/
+  data/
+    raw/
+      images/       → CXR1.png, CXR2.png, ... — never committed, gitignored
+      reports/      → 0001.xml, 0002.xml, ... — never committed, gitignored
+    processed/      → studies.csv, retrieval_chunks.csv
+    splits/         → train/val/test split indices
+  notebooks/
+    01_eda.ipynb               → label frequencies, image stats, class imbalance
+    02_error_analysis.ipynb    → per-class AUROC, confusion analysis
+    03_retrieval_eval.ipynb    → hit rate, qualitative retrieval examples
+  src/
+    data/
+      parse_reports.py         → parse XML, extract findings/impression, map to images
+      build_splits.py          → patient-level stratified split
+      preprocess_images.py     → resize to 224×224, normalize, export tensors
+      build_metadata_table.py  → assemble studies.csv
+    models/
+      image_baseline.py        → DenseNet121/EfficientNet multi-label head
+      train_image.py           → training loop, checkpointing, LR schedule
+      calibrate.py             → temperature scaling, Brier score
+      predict.py               → inference with calibrated probabilities
+    retrieval/
+      chunk_reports.py         → sentence-level chunking of findings + impression text
+      build_faiss.py           → embed chunks, build + save FAISS index
+      retrieve.py              → query by findings + metadata string
+      evaluate_retrieval.py    → top-k hit rate evaluation
+    generation/
+      prompts.py               → system + user prompt templates
+      generate_report.py       → OpenAI API call, retry, schema enforcement
+    api/
+      main.py                  → FastAPI app
+      schemas.py               → request + response pydantic models
+      dependencies.py          → model + FAISS loading at startup
+      routers/                 → health.py, predict.py, retrieve.py, metrics.py
+    ui/
+      streamlit_app.py         → upload, prediction bars, evidence cards, summary
+    utils/
+      metrics.py               → AUROC, F1, calibration helpers
+      paths.py                 → path constants, project root resolution
+      seed.py                  → global seed setter
+  tests/
+    test_api.py, test_schema.py, test_retrieval.py, test_preprocessing.py
+  artifacts/
+    models/     → .pt checkpoints — gitignored if large
+    faiss/      → index.bin + chunks_meta.pkl — gitignored
+    figures/    → plots — committed
+  configs/
+    train_image.yaml      → backbone, LR, batch size, epochs, thresholds
+    retrieval.yaml        → chunk size, embedding model, top-k
+    app.yaml              → API host/port, model paths, generation config
+  Dockerfile, docker-compose.yml, Makefile, pyproject.toml, .env.example, README.md
+```
+
+---
+
+## 4. XML Report Format (Read Before Writing parse_reports.py)
+
+Each report in `data/raw/reports/` is an XML file structured like this:
+
+```xml
+<MedlineCitation>
+  <Abstract>
+    <AbstractText Label="FINDINGS">Mild cardiomegaly. No pneumothorax.</AbstractText>
+    <AbstractText Label="IMPRESSION">No acute cardiopulmonary disease.</AbstractText>
+  </Abstract>
+  <parentImage id="CXR1234_IM-0001-1001"/>
+  <parentImage id="CXR1234_IM-0001-2001"/>
+</MedlineCitation>
+```
+
+**What to extract from each XML:**
+- `findings` — text content of `AbstractText Label="FINDINGS"`
+- `impression` — text content of `AbstractText Label="IMPRESSION"`
+- `image_ids` — all `parentImage id` attributes
+
+**How image IDs map to filenames:**
+The `id` attribute maps directly to a PNG filename:
+```
+parentImage id="CXR1234_IM-0001-1001"  →  data/raw/images/CXR1234_IM-0001-1001.png
+```
+
+One report links to one or more images (typically 2: frontal + lateral).
+Use the frontal view for the CNN input. If you can't distinguish frontal from lateral
+by filename, use the first image ID as the default.
+
+---
+
+## 5. Build Phases
+
+### Phase 1 — Image Classifier (Weeks 1–2)
+
+**Stage 1 — Data pipeline**
+Parse all XML reports. Map each report to its image(s). Produce `studies.csv`.
+**Start with 50–100 samples** to validate the pipeline end-to-end before processing the
+full dataset. Run `01_eda.ipynb` to check label frequencies and class balance.
+→ *Commit: `feat: XML parsing and studies.csv pipeline`*
+→ *Commit: `feat: full dataset processed and splits built`*
+
+**Stage 2 — Image baseline**
+Fine-tune DenseNet121 or EfficientNet-B0 with a multi-label sigmoid head.
+**Start training on the 50–100 sample subset first** to confirm shapes, loss,
+and logging are correct before scaling up.
+Target findings: Cardiomegaly, Pleural Effusion, Edema, Pneumothorax, Consolidation.
+→ *Commit: `feat: image baseline training loop`*
+→ *Commit: `results: image baseline — macro AUROC [add score]`*
+
+**Stage 3 — Calibration**
+Apply temperature scaling on a held-out calibration split. Evaluate Brier score.
+Produce a reliability diagram. All downstream probabilities must be calibrated.
+→ *Commit: `feat: temperature scaling calibration`*
+
+**✓ Phase 1 gate — do not proceed until:**
+- Macro AUROC ≥ 0.70 on validation set (OpenI is smaller than MIMIC — adjust expectations)
+- All 5 per-class AUROCs logged
+- Reliability diagram saved to `artifacts/figures/`
+
+---
+
+### Phase 2 — Retrieval (Week 3)
+
+**Stage 4 — Report chunking**
+Chunk the extracted findings + impression text from `studies.csv` into sentence-level
+segments. Save as `retrieval_chunks.csv`.
+→ *Commit: `feat: report chunking`*
+
+**Stage 5 — FAISS index**
+Embed all chunks with all-MiniLM-L6-v2. Build and save the FAISS index.
+Run `03_retrieval_eval.ipynb`: top-3 hit rate must exceed random baseline before advancing.
+→ *Commit: `feat: FAISS index build and retrieval evaluation`*
+
+---
+
+### Phase 3 — Generation (Week 4)
+
+**Stage 6 — Grounded generation**
+Given calibrated predictions + top-k retrieved chunks, assemble the prompt and call the
+OpenAI API. Validate every response against the `RadiologyReport` pydantic schema.
+Retry up to 2× on invalid responses; return an escalation-flagged fallback if both fail.
+Log schema validity rate and retry rate for every run.
+→ *Commit: `feat: generation pipeline with schema enforcement`*
+→ *Commit: `results: generation — schema validity [add rate]`*
+
+---
+
+### Phase 4 — Product (Week 5)
+
+**Stage 7 — FastAPI service**
+POST /predict, POST /retrieve, GET /health, GET /metrics.
+Load model + FAISS index once at startup in `dependencies.py`.
+→ *Commit: `feat: FastAPI service`*
+
+**Stage 8 — Streamlit UI**
+Image upload, prediction bars, generated summary, evidence cards, low-confidence warning banner.
+Use `@st.cache_resource` for all heavy objects.
+→ *Commit: `feat: Streamlit UI`*
+
+**Stage 9 — Docker + README**
+Single Dockerfile builds the API. `docker-compose up` starts everything.
+README includes architecture diagram, one-command startup, and metric summary.
+→ *Commit: `feat: Dockerfile and docker-compose`*
+→ *Commit: `docs: README with architecture and results`*
+
+---
+
+## 6. Non-Negotiable Rules
+
+### Rule 1 — Split at patient level, never image level
+OpenI reports link to multiple images. Image-level splits leak the same patient's chest
+X-rays across train and test, silently inflating AUROC.
+
+```python
+# CORRECT — group by report/patient ID before splitting
+from sklearn.model_selection import GroupShuffleSplit
+gss = GroupShuffleSplit(n_splits=1, test_size=0.15, random_state=42)
+train_idx, test_idx = next(gss.split(studies, groups=studies["study_id"]))
+
+# WRONG — never do this
+train, test = train_test_split(studies)  # leaks patients across splits
+```
+
+### Rule 2 — Always use calibrated probabilities downstream
+Raw logits must never reach the retrieval query, generation prompt, or API response.
+
+```python
+# CORRECT
+probs = torch.sigmoid(logits / temperature)
+
+# WRONG
+probs = torch.sigmoid(logits)  # only if temperature == 1.0 and verified calibrated
+```
+
+### Rule 3 — Enforce JSON schema on every generation response
+Never pass a raw LLM string as the API response.
+
+```python
+for attempt in range(2):
+    raw = call_openai_api(prompt)
+    clean = raw.strip().removeprefix("```json").removesuffix("```").strip()
+    try:
+        return RadiologyReport.model_validate_json(clean)
+    except ValidationError:
+        continue
+# Fallback if both retries fail
+return RadiologyReport(..., caution="Generation failed", escalate=True)
+```
+
+### Rule 4 — Start with 50–100 samples, not the full dataset
+Debug the full pipeline (parse → train → retrieve → generate → API) on a small subset
+before scaling. A broken pipeline on 50 samples takes minutes to fix. On 3,955 it takes hours.
+
+### Rule 5 — Never touch `data/raw/`
+Treat everything in `data/raw/` as read-only after download. All cleaning, renaming, and
+transformation happens in `src/data/` and outputs go to `data/processed/`.
+
+### Rule 6 — Validate before advancing stages
+Produce a number and a plot at each stage before starting the next one.
+
+### Rule 7 — Commit at every stage boundary
+Use the commit messages in Section 5. Never leave a working state uncommitted.
+Commit intermediate working states too (e.g. a working parser before the full pipeline).
+
+---
+
+## 7. Key Hyperparameters
+
+| Hyperparameter | Stage | Values to Try | Notes |
+|---|---|---|---|
+| backbone | Stage 2 | DenseNet121, EfficientNet-B0 | Speed vs accuracy |
+| learning_rate | Stage 2 | 1e-4, 3e-4, 1e-3 | Fine-tuning range |
+| batch_size | Stage 2 | 16, 32, 64 | GPU memory dependent |
+| temperature | Stage 3 | 0.5–2.0 grid | Calibration |
+| chunk_size | Stage 4 | sentence, 3-sentence, paragraph | Retrieval granularity |
+| embedding_model | Stage 5 | all-MiniLM-L6-v2, all-mpnet-base-v2 | Index quality |
+| top_k | Stage 5 | 3, 5, 7 | Evidence chunks per prompt |
+| confidence_threshold | Stage 2/6 | 0.3, 0.4, 0.5 | Finding inclusion cutoff |
+
+---
+
+## 8. Evaluation Metrics
+
+**Phase 1 — Classifier**
+- Per-class AUROC for all 5 findings
+- Macro AUROC (headline number; target ≥ 0.70 on OpenI)
+- F1 at operating threshold
+- Brier score + reliability diagram
+
+**Phase 2 — Retrieval**
+- Top-3 hit rate: fraction of queries retrieving ≥1 chunk from a same-label report
+- 5–10 qualitative (query → top-3 chunks) examples in `03_retrieval_eval.ipynb`
+
+**Phase 3 — Generation**
+- JSON schema validity rate on first attempt (target > 95%)
+- Retry rate + escalation rate
+
+**Phase 4 — Product**
+- Median + p95 end-to-end latency for POST /predict
+
+---
+
+## 9. Schemas
+
+### `studies.csv`
+```
+study_id, image_path, report_text, findings, impression
+```
+`study_id` maps to the XML filename (e.g. `0001` for `0001.xml`).
+`image_path` points to the primary (frontal) PNG in `data/raw/images/`.
+
+### `retrieval_chunks.csv`
+```
+chunk_id, study_id, chunk_text, section
+```
+`section`: "findings" or "impression".
+
+### `RadiologyReport` pydantic schema
+```python
+class RadiologyReport(BaseModel):
+    findings:   str
+    impression: str
+    rationale:  str
+    caution:    str
+    escalate:   bool
+    confidence: Literal["high", "moderate", "low"]
+```
+
+### POST /predict
+```json
+// request
+{ "image_path": "data/raw/images/CXR123.png", "clinical_indication": "shortness of breath" }
+
+// response
+{
+  "predictions": [{"label": "Edema", "prob": 0.79}, {"label": "Pleural Effusion", "prob": 0.73}],
+  "retrieved_evidence": [{"chunk_id": "c88", "text": "Bilateral interstitial...", "score": 0.84}],
+  "summary": {
+    "findings": "Bilateral interstitial opacities with small pleural effusions.",
+    "impression": "Pattern may reflect pulmonary edema / CHF.",
+    "rationale": "Evidence chunks 1–2 describe similar bilateral opacities in CHF context.",
+    "caution": "Model output is for research use only. Not validated for clinical use.",
+    "escalate": false, "confidence": "moderate"
+  }
+}
+```
+
+---
+
+## 10. Generation Prompts
+
+### System prompt
+```
+You are a radiology decision-support assistant.
+Use only the predictions and retrieved evidence provided.
+Do not invent findings not present in the evidence.
+Return ONLY a valid JSON object with keys: findings, impression, rationale, caution, escalate, confidence.
+No markdown, no code fences, no text outside the JSON.
+```
+
+### User prompt template
+```
+Predicted findings (calibrated probabilities, threshold = 0.4):
+{findings_list}
+
+Retrieved evidence (top {top_k} chunks):
+{evidence_chunks}
+
+Generate: findings, impression, rationale, caution, escalate (bool), confidence (high/moderate/low).
+```
+
+---
+
+## 11. Agent Onboarding (Do This First, Every Session)
+
+```
+1. Read the src/ files for your current stage
+2. Read one adjacent completed stage file to understand existing patterns
+3. Check artifacts/models/ for saved checkpoints
+4. Check configs/ for hyperparameters already set
+5. Confirm your understanding before writing any code:
+   - "Image pipeline produces [B, 3, 224, 224] tensors, ImageNet normalization"
+   - "studies.csv has N rows; image_path points to data/raw/images/"
+   - "FAISS index at artifacts/faiss/index.bin, metadata in chunks_meta.pkl"
+6. Then implement
+```
+
+**Never write code against assumed shapes or file paths. Verify first.**
+
+---
+
+## 12. Session Prompt (Paste at Start of Every New Session)
+
+```
+You are working on RadReason — a multimodal chest X-ray copilot combining a
+multi-label CNN classifier, FAISS retrieval over radiology reports, and grounded
+LLM generation to produce structured radiology summaries.
+
+Dataset: OpenI IU Chest X-ray — PNG images + XML reports in data/raw/.
+Images link to reports via parentImage id attributes in the XML.
+
+Before writing any code:
+1. Read the src/ files for the stage you're working on.
+2. Check artifacts/models/ and artifacts/faiss/ for saved state.
+3. Read configs/ for hyperparameters already set.
+4. Summarize tensor shapes, file paths, and schema before implementing.
+
+Rules — no exceptions:
+- Split at PATIENT/STUDY level, never image level
+- Never pass raw logits downstream — apply temperature scaling first
+- Validate every LLM response against RadiologyReport pydantic schema
+- Start with 50–100 samples; scale only after pipeline is validated end-to-end
+- Never modify data/raw/ — all transformations output to data/processed/
+- Produce a metric + plot before advancing stages
+- Commit at every stage boundary (see Section 5 for commit messages)
+- Commit intermediate working states too — don't wait for stage completion
+
+Environment: Python 3.10 | PyTorch, torchvision, sentence-transformers, faiss-cpu, FastAPI, Streamlit
+OPENAI_API_KEY in .env | outputs → artifacts/ | model definitions → src/models/
+
+Task: [PASTE TASK HERE]
+```
+
+---
+
+## 13. Status Tracker
+
+Update manually at the end of each session.
+
+| Stage | Status | Key Result | Committed |
+|---|---|---|---|
+| 1 — Data pipeline + studies.csv | Not started | — | ☐ |
+| 2 — Image baseline | Not started | — | ☐ |
+| 3 — Calibration | Not started | — | ☐ |
+| **Phase 1 gate** | Not started | macro AUROC ≥ 0.70 | — |
+| 4 — Report chunking | Not started | — | ☐ |
+| 5 — FAISS index + eval | Not started | — | ☐ |
+| 6 — Generation + schema | Not started | — | ☐ |
+| 7 — FastAPI | Not started | — | ☐ |
+| 8 — Streamlit UI | Not started | — | ☐ |
+| 9 — Docker + README | Not started | — | ☐ |
+
+---
+
+## 14. Known Gotchas
+
+**OpenI XML reports sometimes have empty FINDINGS or IMPRESSION fields.** Handle this
+in `parse_reports.py` — treat missing fields as empty strings, not errors. Log how many
+reports have missing fields before proceeding.
+
+**One report links to multiple images.** Use the first `parentImage` id as the primary
+image for the CNN. Optionally log which reports have >2 images (some have frontal + lateral
++ additional views).
+
+**Image IDs in XML must match filenames exactly.** The `parentImage id` attribute is the
+filename stem. If a lookup fails, log the missing ID and skip rather than crashing.
+
+**Multi-label loss, not CrossEntropy.** Use `BCEWithLogitsLoss`. Treat `no_finding` as
+an independent binary label.
+
+**OpenI is smaller than MIMIC — AUROC targets are lower.** ~4K reports means smaller
+train sets and higher variance in metrics. Target macro AUROC ≥ 0.70, not 0.80+.
+Report confidence intervals or variance across runs.
+
+**Start with 50–100 samples.** Parse 50–100 XMLs, run the full pipeline, confirm
+studies.csv is correct, training loop runs, retrieval returns results, generation
+produces valid JSON — then scale to the full dataset.
+
+**Rebuild the FAISS index if the embedding model changes.** The index is model-specific.
+Never mix embeddings from different models in the same index.
+
+**gpt-5-mini can return markdown fences even when instructed not to.** Always strip before
+parsing: `raw.strip().removeprefix("```json").removesuffix("```").strip()`
+
+**Temperature scaling needs its own calibration split.** Do not calibrate on the same
+validation set used for model selection. Reserve ~5% of validation for temperature tuning.
+
+**Streamlit reruns the whole script on every interaction.** Wrap the model and FAISS index
+in `@st.cache_resource` or the UI will be unusably slow.
+
+**Commit working intermediate states, not just stage completions.** If the XML parser
+works but studies.csv isn't finished, commit the parser. Losing working code is painful.
+
+---
+
+*This document is the source of truth for agent context. Update the Status Tracker at the end of each session.*

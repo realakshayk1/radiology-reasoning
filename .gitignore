@@ -1,0 +1,17 @@
+# Data
+data/raw/
+**/dummy_images/
+
+# Artifacts
+artifacts/models/*.pt
+artifacts/faiss/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints
