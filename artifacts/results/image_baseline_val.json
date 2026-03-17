@@ -1,0 +1,11 @@
+{
+    "per_class": {
+        "cardiomegaly": 0.8903260869565217,
+        "effusion": 0.5343073465041996,
+        "edema": 0.7597649186256781,
+        "pneumothorax": 0.5544322344322343,
+        "consolidation": 0.5736625514403292
+    },
+    "macro_auroc": 0.6624986275917926,
+    "pass_gate": false
+}
