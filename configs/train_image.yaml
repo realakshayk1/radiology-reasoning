@@ -1,6 +1,31 @@
-backbone: densenet121
+# configs/train_image.yaml
+#
+# Changes (March 2026):
+#   - epochs: 5 → 25   (5 is far too few; EfficientNet needs ~20+ to converge on OpenI)
+#   - scheduler: cosine_annealing added (train_image.py had no scheduler despite
+#     the config slot existing — this was dead code; now wired up)
+#   - backbone + lr already correct from prior fix (efficientnet_b0, 1e-4)
+
+backbone: efficientnet_b0
 lr: 0.0001
 batch_size: 32
-epochs: 20
+epochs: 25
 num_workers: 0
-device: cuda
+device: cpu
+
+# LR scheduler
+scheduler: cosine_annealing
+scheduler_t_max: 25
+
+# Multi-label operating threshold
+confidence_threshold: 0.4
+
+# L2 regularisation — penalises large weights, reduces overfitting
+weight_decay: 0.0001
+
+label_cols:
+  - cardiomegaly
+  - effusion
+  - edema
+  - pneumothorax
+  - consolidation

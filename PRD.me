@@ -15,7 +15,7 @@ clinician-readable summary with citations.
    thoracic findings without private EHR access?
 2. Can RAG over radiology reports produce grounded summaries that follow a strict JSON schema?
 
-**Stack in one line:** PyTorch image classifier → FAISS retrieval → GPT-5 mini generation → FastAPI + Streamlit.
+**Stack in one line:** PyTorch image classifier → FAISS retrieval → GPT-5.4 mini generation → FastAPI + Streamlit.
 
 **Dataset: OpenI IU Chest X-ray**
 Indiana University chest X-ray collection — 3,955 radiology reports paired with 7,470 PNG
@@ -40,7 +40,7 @@ the metadata table. Never store raw data in a public repo.
 | Loss | BCEWithLogitsLoss (multi-label) |
 | Calibration | Temperature scaling (custom) |
 | Retrieval | sentence-transformers, FAISS (faiss-cpu) |
-| Generation | OpenAI API — `gpt-5-mini-2025-08-07` |
+| Generation | OpenAI API — `gpt-5.4-mini-2026-03-17` |
 | Schema enforcement | pydantic v2 |
 | API | FastAPI + uvicorn |
 | UI | Streamlit |
@@ -427,6 +427,7 @@ Rules — no exceptions:
 - Produce a metric + plot before advancing stages
 - Commit at every stage boundary (see Section 5 for commit messages)
 - Commit intermediate working states too — don't wait for stage completion
+- Never submit finalized results with mocked data/results, always ask for additional information if needed
 
 Environment: Python 3.10 | PyTorch, torchvision, sentence-transformers, faiss-cpu, FastAPI, Streamlit
 OPENAI_API_KEY in .env | outputs → artifacts/ | model definitions → src/models/
@@ -442,16 +443,16 @@ Update manually at the end of each session.
 
 | Stage | Status | Key Result | Committed |
 |---|---|---|---|
-| 1 — Data pipeline + studies.csv | Not started | — | ☐ |
-| 2 — Image baseline | Not started | — | ☐ |
-| 3 — Calibration | Not started | — | ☐ |
-| **Phase 1 gate** | Not started | macro AUROC ≥ 0.70 | — |
-| 4 — Report chunking | Not started | — | ☐ |
-| 5 — FAISS index + eval | Not started | — | ☐ |
-| 6 — Generation + schema | Not started | — | ☐ |
-| 7 — FastAPI | Not started | — | ☐ |
-| 8 — Streamlit UI | Not started | — | ☐ |
-| 9 — Docker + README | Not started | — | ☐ |
+| 1 — Data pipeline + studies.csv | Complete | 3,955 reports parsed | [x] |
+| 2 — Image baseline | In Progress | Macro AUROC 0.66 (Target 0.70) | [/] |
+| 3 — Calibration | Complete | Brier 0.1622, Temp 1.25 | [x] |
+| **Phase 1 gate** | In Progress | macro AUROC ≥ 0.70 | — |
+| 4 — Report chunking | Complete | Sentence-level segments | [x] |
+| 5 — FAISS index + eval | Complete | Hit@1: 0.13, Hit@3: 0.22 | [x] |
+| 6 — Generation + schema | Complete | 100% schema validity | [x] |
+| 7 — FastAPI | Complete | /predict and /health functional | [x] |
+| 8 — Streamlit UI | Complete | Integration verified | [x] |
+| 9 — Docker + README | Complete | Documentation finalized | [x] |
 
 ---
 
@@ -482,7 +483,7 @@ produces valid JSON — then scale to the full dataset.
 **Rebuild the FAISS index if the embedding model changes.** The index is model-specific.
 Never mix embeddings from different models in the same index.
 
-**gpt-5-mini can return markdown fences even when instructed not to.** Always strip before
+**gpt-5.4-nano can return markdown fences even when instructed not to.** Always strip before
 parsing: `raw.strip().removeprefix("```json").removesuffix("```").strip()`
 
 **Temperature scaling needs its own calibration split.** Do not calibrate on the same

@@ -40,13 +40,15 @@ def build_metadata_table(
     missing_images = []
 
     # Target findings for multi-label classification
+    # NOTE: no_finding is intentionally excluded here.
+    # train_image.py LABEL_COLS = [cardiomegaly, effusion, edema, pneumothorax, consolidation]
+    # Adding a 6th label column that training never reads creates a silent mismatch.
     FINDINGS_KEYWORDS = {
         "cardiomegaly": ["cardiomegaly"],
         "effusion": ["effusion"],
         "edema": ["edema"],
         "pneumothorax": ["pneumothorax"],
         "consolidation": ["consolidation"],
-        "no_finding": ["no acute", "normal"]
     }
 
     def has_negation(text, keyword, window=3):
@@ -82,21 +84,16 @@ def build_metadata_table(
         # Basic cleanup for negation check (remove punctuation)
         clean_text = combined_lower.replace(".", " ").replace(",", " ").replace(";", " ")
 
-        # Extract binary labels
+        # Extract binary labels (negation-aware)
         label_dict = {}
         for label, keywords in FINDINGS_KEYWORDS.items():
-            if label == "no_finding":
-                # For no_finding, positive if any keyword is present
-                label_dict[label] = 1 if any(kw in clean_text for kw in keywords) else 0
-            else:
-                # For findings, positive if keyword is present AND NOT negated
-                is_positive = 0
-                for kw in keywords:
-                    if kw in clean_text:
-                        if not has_negation(clean_text, kw):
-                            is_positive = 1
-                            break
-                label_dict[label] = is_positive
+            is_positive = 0
+            for kw in keywords:
+                if kw in clean_text:
+                    if not has_negation(clean_text, kw):
+                        is_positive = 1
+                        break
+            label_dict[label] = is_positive
 
         rows.append({
             "study_id": rec["study_id"],

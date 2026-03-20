@@ -1,15 +1,12 @@
 """
 preprocess_images.py — Resize and normalize OpenI PNG images for the CNN.
 
-Transform pipeline:
-  1. Load PNG (convert to RGB — handles grayscale CXRs)
-  2. Resize to 224×224
-  3. ToTensor → [0, 1] float32
-  4. Normalize with ImageNet mean/std
+Two transforms are exported:
+  TRAIN_TRANSFORM — augmented (flip, rotate, color jitter) for training only
+  TRANSFORM       — clean resize + normalize for val/test/inference
 
-Assertions on first batch:
-  - tensor.shape == (batch_size, 3, 224, 224)
-  - tensor.dtype == torch.float32
+Using separate transforms is critical: augmentation must never be applied
+during validation or inference, or AUROC will be artificially degraded.
 """
 
 import os
@@ -26,8 +23,22 @@ logger = logging.getLogger(__name__)
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
+# Val/test/inference transform — no augmentation
 TRANSFORM = transforms.Compose([
     transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+
+# Training transform — augmentation to fight overfitting on small OpenI dataset
+# Horizontal flip: CXRs are bilaterally symmetric — safe augmentation
+# Rotation ±10°: mimics patient positioning variation
+# ColorJitter: handles scanner/exposure variation across sites
+TRAIN_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(degrees=10),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
     transforms.ToTensor(),
     transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
 ])

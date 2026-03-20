@@ -1,8 +1,8 @@
 """
-image_baseline.py — DenseNet121 multi-label classifier for OpenI dataset.
+image_baseline.py — Multi-label classifier for OpenI dataset.
 
-Backbone: DenseNet121 (ImageNet pretrained)
-Head: Linear layer with 5 outputs (Sigmoid applied via BCEWithLogitsLoss)
+Backbone: EfficientNet-B0 (ImageNet pretrained) — configurable via train_image.yaml
+Head: Dropout(0.4) + Linear with 5 outputs (Sigmoid applied via BCEWithLogitsLoss)
 Findings: Cardiomegaly, Pleural Effusion, Edema, Pneumothorax, Consolidation
 """
 
@@ -11,9 +11,9 @@ import torch.nn as nn
 from torchvision import models
 
 class ImageBaseline(nn.Module):
-    """DenseNet121 multi-label classifier."""
+    """EfficientNet-B0 multi-label classifier (backbone configurable)."""
     
-    def __init__(self, backbone_name="densenet121", num_classes=5, pretrained=True):
+    def __init__(self, backbone_name="efficientnet_b0", num_classes=5, pretrained=True):
         super(ImageBaseline, self).__init__()
         
         if backbone_name == "densenet121":
@@ -30,6 +30,8 @@ class ImageBaseline(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone: {backbone_name}")
             
+        # Dropout before classifier head — reduces overfitting on small OpenI dataset
+        self.dropout = nn.Dropout(p=0.4)
         self.fc = nn.Linear(in_features, num_classes)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -38,7 +40,7 @@ class ImageBaseline(nn.Module):
         Output: (B, 5) logits
         """
         features = self.backbone(x)
-        logits = self.fc(features)
+        logits = self.fc(self.dropout(features))
         
         # Assertion on output shape
         # Note: In PyTorch models, batch_size is dynamic, but we can check num_classes.
@@ -49,17 +51,16 @@ class ImageBaseline(nn.Module):
 def get_model(config):
     """Factory function for model creation."""
     return ImageBaseline(
-        backbone_name=config.get("backbone", "densenet121"),
+        backbone_name=config.get("backbone", "efficientnet_b0"),
         num_classes=5,
         pretrained=True
     )
 
 if __name__ == "__main__":
-    # Test forward pass with dummy data
-    model = ImageBaseline(backbone_name="densenet121", num_classes=5, pretrained=False)
+    # Test both backbones
     dummy_input = torch.randn(4, 3, 224, 224)
-    logits = model(dummy_input)
-    print(f"Input shape: {dummy_input.shape}")
-    print(f"Output shape: {logits.shape}")
-    assert logits.shape == (4, 5)
-    print("Forward pass successful.")
+    for backbone in ["densenet121", "efficientnet_b0"]:
+        model = ImageBaseline(backbone_name=backbone, num_classes=5, pretrained=False)
+        logits = model(dummy_input)
+        assert logits.shape == (4, 5), f"{backbone}: bad shape {logits.shape}"
+        print(f"{backbone}: input={dummy_input.shape} output={logits.shape} OK")

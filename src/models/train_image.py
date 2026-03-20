@@ -21,7 +21,7 @@ from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
 from src.models.image_baseline import get_model
-from src.data.preprocess_images import OpenIDataset
+from src.data.preprocess_images import OpenIDataset, TRAIN_TRANSFORM
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -131,19 +131,51 @@ def main():
             assert pos_count >= 10, \
                 f"{label} has only {pos_count} positives — too few to train reliably"
 
-    train_ds = OpenIDataset(train_df, label_cols=LABEL_COLS)
-    val_ds = OpenIDataset(val_df, label_cols=LABEL_COLS)
+    # Train gets augmented transform; val gets clean transform (no augmentation)
+    train_ds = OpenIDataset(train_df, label_cols=LABEL_COLS, transform=TRAIN_TRANSFORM)
+    val_ds   = OpenIDataset(val_df,   label_cols=LABEL_COLS)
     
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True, num_workers=cfg.get("num_workers", 0))
     val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False, num_workers=cfg.get("num_workers", 0))
     
     # 3. Model & Optimizer
     model = get_model(cfg).to(device)
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(model.parameters(), lr=float(cfg["lr"]))
-    
+
+    # pos_weight: upweights rare positive classes in BCEWithLogitsLoss.
+    # For each class: weight = neg_count / pos_count
+    # Effect: a consolidation positive (rare) contributes as much to the loss
+    # as ~N consolidation negatives, stopping the model from predicting all-negative.
+    # Computed from train_df so it's always correct regardless of split randomness.
+    pos_counts = train_df[LABEL_COLS].sum(axis=0).values.astype(float)
+    neg_counts = (len(train_df) - train_df[LABEL_COLS].sum(axis=0)).values.astype(float)
+    # Clamp to avoid division by zero if a class has 0 positives in this split
+    pos_counts = pos_counts.clip(min=1.0)
+    raw_weights = neg_counts / pos_counts
+    # Cap at 10 — very high weights destabilise training on tiny positive sets
+    raw_weights = raw_weights.clip(max=5.0)  # lowered from 10 — extreme weights destabilise training
+    pos_weight = torch.tensor(raw_weights, dtype=torch.float32).to(device)
+    for label, w in zip(LABEL_COLS, raw_weights):
+        logger.info(f"  pos_weight {label:<15}: {w:.2f}")
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = optim.Adam(model.parameters(), lr=float(cfg["lr"]), weight_decay=cfg.get("weight_decay", 1e-4))
+
+    # Scheduler (optional — read from configs/train_image.yaml)
+    scheduler = None
+    sched_type = cfg.get("scheduler", "none")
+    if sched_type == "cosine_annealing":
+        t_max = cfg.get("scheduler_t_max", cfg["epochs"])
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max)
+        logger.info(f"Using CosineAnnealingLR with T_max={t_max}")
+    elif sched_type == "step":
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+        logger.info("Using StepLR scheduler")
+    else:
+        logger.info("No LR scheduler configured")
+
     # 4. Training Loop
     best_auroc = 0.0
+    patience = 5
+    epochs_no_improve = 0
     os.makedirs("artifacts/models", exist_ok=True)
     
     for epoch in range(cfg["epochs"]):
@@ -154,12 +186,25 @@ def main():
         for label, score in aurocs.items():
             logger.info(f"  {label:<15}: {score:.4f}")
             
-        # Save best
+        # Step LR scheduler
+        if scheduler is not None:
+            scheduler.step()
+
+        # Check for improvement
         if macro_auroc > best_auroc:
             best_auroc = macro_auroc
+            epochs_no_improve = 0
             assert macro_auroc > 0.0, "Refusing to save checkpoint with 0 AUROC"
             torch.save(model.state_dict(), "artifacts/models/best_model.pt")
             logger.info(f"Saved new best model with AUROC {best_auroc:.4f}")
+        else:
+            epochs_no_improve += 1
+            logger.info(f"No improvement in Macro AUROC for {epochs_no_improve} epoch(s)")
+
+        # Early stopping
+        if epochs_no_improve >= patience:
+            logger.info(f"Early stopping triggered: Macro AUROC has not improved for {patience} epochs.")
+            break
             
     logger.info(f"Training complete. Best Macro AUROC: {best_auroc:.4f}")
     

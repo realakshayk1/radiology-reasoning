@@ -56,7 +56,8 @@ def main():
             assert report.confidence in ("high", "moderate", "low"), f"invalid confidence: {report.confidence}"
             
             # If it reached here without Exception and passed assertions, it's valid
-            if "TECHNICAL ERROR" not in report.findings:
+            # Fix: check report.caution instead of report.findings for TECHNICAL ERROR
+            if "TECHNICAL ERROR" not in report.caution:
                 success_count += 1
                 logger.info(f"  Result: PASS (Confidence: {report.confidence})")
             else:
@@ -64,6 +65,9 @@ def main():
                 
         except Exception as e:
             logger.error(f"  Result: ERROR ({e})")
+            # If it's a validation error, print some details
+            if "validation error" in str(e).lower():
+                print(f"DEBUG: {e}")
 
     validity_rate = success_count / total
     print(f"\nFinal Schema Validity Rate: {validity_rate:.2%}")

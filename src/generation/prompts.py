@@ -6,6 +6,7 @@ SYSTEM_PROMPT = """You are a radiology decision-support assistant.
 Use only the predictions and retrieved evidence provided.
 Do not invent findings not present in the evidence.
 Return ONLY a valid JSON object with keys: findings, impression, rationale, caution, escalate, confidence.
+Each value must be a single string (except escalate which is bool). No lists.
 No markdown, no code fences, no text outside the JSON."""
 
 USER_PROMPT_TEMPLATE = """Predicted findings (calibrated probabilities, threshold = 0.4):
